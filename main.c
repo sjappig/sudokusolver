@@ -3,7 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define VERSION "0.0.1"
+#define VERSION "0.0.2"
 
 #define LOG_INF(fmt, ...) fprintf(stdout, "[INF] " fmt "\n", ##__VA_ARGS__)
 #define LOG_ERR(fmt, ...) fprintf(stderr, "[ERR] " fmt "\n", ##__VA_ARGS__)
@@ -58,6 +58,18 @@ char field_to_char(const field* f) {
     return 'E';
 }    
 
+void init_derived_fields(sudoku* s) {
+    for (int i = 0; i < 9; ++i) {
+        for (int j = 0; j < 9; ++j) {
+            s->rows[j].fields[i] = &s->fields[i][j];
+            s->columns[i].fields[j] = &s->fields[i][j];
+            int block_num = j / 3 + i / 3 * 3;
+            int inter_block_num = j % 3 + i % 3 * 3;
+            s->blocks[block_num].fields[inter_block_num] = &s->fields[i][j];
+        }
+    }
+}
+
 int read_sudoku(const char* filename, sudoku* s) {
     FILE* fp = fopen(filename, "r");
 
@@ -97,11 +109,6 @@ int read_sudoku(const char* filename, sudoku* s) {
                 LOG_ERR("Unexpected character '%c'", (char)c);
                 return 1;
             }
-            s->rows[j].fields[i] = &s->fields[i][j];
-            s->columns[i].fields[j] = &s->fields[i][j];
-            int block_num = j / 3 + i / 3 * 3;
-            int inter_block_num = j % 3 + i % 3 * 3;
-            s->blocks[block_num].fields[inter_block_num] = &s->fields[i][j];
         }
         int eol = fgetc(fp);
         if (eol == '|')
@@ -114,6 +121,8 @@ int read_sudoku(const char* filename, sudoku* s) {
     }
 
     fclose(fp);
+
+    init_derived_fields(s);
 
     return 0;
 }
@@ -182,18 +191,35 @@ int has_sudoku_error(const sudoku* s, int log_error) {
     return 0;
 }
 
-void simplify_fields(field* fields[9]) {
+int simplify_fields(field* fields[9]) {
+    int rv = 0;
     for (int i = 0; i < 9; ++i) {
         uint16_t value = fields[i]->possible_numbers;
         uint8_t nbits = count_bits(value);
         if (nbits == 1) {
             for (int j = 0; j < 9; ++j) {
                 if (j != i) {
+                    uint16_t old_value = fields[j]->possible_numbers;
                     fields[j]->possible_numbers &= ~value;
+                    rv |= old_value ^ fields[j]->possible_numbers;
+                }
+            }
+        } else if (nbits > 1) {
+            uint16_t available_bits = (1 << 9) - 1;
+            for (int j = 0; j < 9; ++j) {
+                if (j != i) {
+                    available_bits &= ~fields[j]->possible_numbers;
+                }
+            }
+            if (count_bits(available_bits) == 1) {
+                if (value & available_bits) {
+                    fields[i]->possible_numbers = available_bits;
+                    rv |= 1;
                 }
             }
         }
     }
+    return rv;
 }
 
 int is_sudoku_solved(const sudoku* s) {
@@ -208,34 +234,80 @@ int is_sudoku_solved(const sudoku* s) {
     return 1;
 }
 
-int solve_sudoku(sudoku* s, int max_rounds, int check_interval) {
-    int round = 0;
-    while (round++ < max_rounds) {
-        for (int i = 0; i < 9; ++i) {
-            int error_idx = 0;
-            simplify_fields(s->blocks[i].fields);
-            if (has_fields_error(s->blocks[i].fields, &error_idx)) {
-                LOG_ERR("Error in block %d, index %d", i, error_idx);
-                return 0;
-            }
-            simplify_fields(s->rows[i].fields);
-            if (has_fields_error(s->rows[i].fields, &error_idx)) {
-                LOG_ERR("Error in column %d, index %d", i, error_idx);
-                return 0;
-            }
-            simplify_fields(s->columns[i].fields);
-            if (has_fields_error(s->columns[i].fields, &error_idx)) {
-                LOG_ERR("Error in row %d, index %d", i, error_idx);
-                return 0;
-            }
+int simplify_sudoku(sudoku* s) {
+    int rv = 0;
+    for (int i = 0; i < 9; ++i) {
+        int error_idx = 0;
+        rv |= simplify_fields(s->blocks[i].fields);
+        if (has_fields_error(s->blocks[i].fields, &error_idx)) {
+            return 0;
         }
-        if (round % check_interval == 0) {
-            if (is_sudoku_solved(s)) {
-                return 1;
-            }
+        rv |= simplify_fields(s->rows[i].fields);
+        if (has_fields_error(s->rows[i].fields, &error_idx)) {
+            return 0;
+        }
+        rv |= simplify_fields(s->columns[i].fields);
+        if (has_fields_error(s->columns[i].fields, &error_idx)) {
+            return 0;
         }
     }
-    return is_sudoku_solved(s);
+    return rv;
+}
+
+void copy_sudoku_with_guess(sudoku* dest, const sudoku* src, int guesses) {
+    memcpy(dest, src, sizeof(sudoku));
+    init_derived_fields(dest);
+
+    int n_guess = 0;
+
+    while (n_guess < guesses) {
+        int type = rand() % 3;
+        int index = rand() % 9;
+        int sub_index = rand() % 9;
+        field* field_to_change = NULL;
+        switch (type) {
+            case 0:
+                field_to_change = dest->blocks[index].fields[sub_index];
+                break;
+            case 1:
+                field_to_change = dest->rows[index].fields[sub_index];
+                break;
+            case 2:
+                field_to_change = dest->columns[index].fields[sub_index];
+                break;
+        }
+        if (count_bits(field_to_change->possible_numbers) <= 1)
+            continue;
+
+        uint16_t guess = (1 << (rand() % 8)) & field_to_change->possible_numbers;
+        if (!guess)
+            continue;
+
+        field_to_change->possible_numbers = guess;
+        ++n_guess;
+    }
+}
+
+int solve_sudoku(sudoku* s, int max_rounds) {
+    while (simplify_sudoku(s)) {
+    }
+    if (is_sudoku_solved(s)) {
+        return 1;
+    }
+
+    int round = 0;
+    sudoku fork_s;
+    LOG_INF("Guessing numbers...");
+    while (round++ < max_rounds) {
+        copy_sudoku_with_guess(&fork_s, s, 1);
+        while (simplify_sudoku(&fork_s)) {
+        }
+        if (is_sudoku_solved(&fork_s)) {
+            copy_sudoku_with_guess(s, &fork_s, 0);
+            return 1;
+        }
+    }
+    return 0;
 }
 
 int main(int argc, char** argv) {
@@ -264,10 +336,13 @@ int main(int argc, char** argv) {
 
     LOG_INF("Given sudoku seems correct, trying to solve");
     
-    if (!solve_sudoku(&s, 1000, 10)) {
+    if (!solve_sudoku(&s, 100)) {
         LOG_ERR("Solving sudoku failed");
     } else {
         LOG_INF("Sudoku solved!");
+    }
+    if (has_sudoku_error(&s, 1)) {
+        LOG_ERR("Sudoko has error");
     }
     LOG_INF("Final sudoku:");
     print_sudoku(&s);
